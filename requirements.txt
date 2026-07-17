@@ -1,0 +1,193 @@
+"""
+PrimeBank Customer Retention Intelligence — Interactive Streamlit App
+Deploy for free at https://share.streamlit.io by connecting this GitHub repo.
+
+Run locally with: streamlit run app.py
+"""
+import streamlit as st
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import joblib
+import shap
+import os
+
+st.set_page_config(page_title="PrimeBank Churn Intelligence", page_icon="🏦", layout="wide")
+
+NAVY, TEAL, ORANGE, RED = "#1f3b57", "#2a9d8f", "#e76f51", "#c0392b"
+MODEL_PATH = os.path.join(os.path.dirname(__file__), "..", "models", "churn_model.pkl")
+OPTIMAL_THRESHOLD = 0.43  # from the business economics notebook
+
+FEATURE_COLS = ["CreditScore","Geography","Gender","Age","Tenure","Balance",
+                "NumOfProducts","HasCrCard","IsActiveMember","EstimatedSalary",
+                "balance_to_salary","risk_flag_count"]
+CATEGORICAL_COLS = ["Geography", "Gender"]
+NUMERIC_COLS = [c for c in FEATURE_COLS if c not in CATEGORICAL_COLS]
+
+
+@st.cache_resource
+def load_model():
+    return joblib.load(MODEL_PATH)
+
+
+def build_features(credit_score, geography, gender, age, tenure, balance,
+                    num_products, has_cr_card, is_active, salary):
+    balance_to_salary = balance / salary if salary > 0 else 0
+    is_multi_product_risk = 1 if num_products >= 3 else 0
+    is_inactive = 1 if is_active == 0 else 0
+    is_germany = 1 if geography == "Germany" else 0
+    has_zero_balance = 1 if balance == 0 else 0
+    risk_flag_count = is_multi_product_risk + is_inactive + is_germany + has_zero_balance
+
+    return pd.DataFrame([{
+        "CreditScore": credit_score, "Geography": geography, "Gender": gender,
+        "Age": age, "Tenure": tenure, "Balance": balance,
+        "NumOfProducts": num_products, "HasCrCard": has_cr_card,
+        "IsActiveMember": is_active, "EstimatedSalary": salary,
+        "balance_to_salary": balance_to_salary, "risk_flag_count": risk_flag_count,
+    }])
+
+
+def main():
+    st.title("🏦 PrimeBank Customer Retention Intelligence")
+    st.caption("Predict churn risk for an individual customer and see exactly why — built on a real 10,000-customer bank dataset, validated with hypothesis testing, and tied to a business economics case.")
+
+    tab1, tab2, tab3 = st.tabs(["🔍 Churn Predictor", "📊 Project Insights", "ℹ️ About This Project"])
+
+    model = load_model()
+
+    # =========================================================================
+    # TAB 1: INTERACTIVE PREDICTOR
+    # =========================================================================
+    with tab1:
+        st.subheader("Enter a customer profile")
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            credit_score = st.slider("Credit Score", 300, 850, 650)
+            geography = st.selectbox("Geography", ["France", "Germany", "Spain"])
+            gender = st.selectbox("Gender", ["Female", "Male"])
+            age = st.slider("Age", 18, 92, 40)
+
+        with col2:
+            tenure = st.slider("Tenure (years as customer)", 0, 10, 5)
+            balance = st.number_input("Account Balance ($)", 0.0, 300000.0, 75000.0, step=1000.0)
+            num_products = st.selectbox("Number of Products Held", [1, 2, 3, 4])
+            salary = st.number_input("Estimated Salary ($)", 10.0, 200000.0, 60000.0, step=1000.0)
+
+        with col3:
+            has_cr_card = st.radio("Has Credit Card?", ["Yes", "No"], horizontal=True)
+            is_active = st.radio("Active Member?", ["Yes", "No"], horizontal=True)
+            st.markdown("&nbsp;")
+            predict_clicked = st.button("Predict Churn Risk", type="primary", use_container_width=True)
+
+        if predict_clicked:
+            X_input = build_features(
+                credit_score, geography, gender, age, tenure, balance,
+                num_products, 1 if has_cr_card == "Yes" else 0,
+                1 if is_active == "Yes" else 0, salary
+            )
+
+            proba = model.predict_proba(X_input)[0, 1]
+            risk_label = "🔴 High Risk" if proba >= OPTIMAL_THRESHOLD else "🟢 Low Risk"
+
+            st.divider()
+            res_col1, res_col2 = st.columns([1, 2])
+
+            with res_col1:
+                st.metric("Predicted Churn Probability", f"{proba*100:.1f}%")
+                st.metric("Risk Category", risk_label)
+                st.caption(f"Flagged as at-risk if probability ≥ {OPTIMAL_THRESHOLD*100:.0f}% "
+                           f"(the profit-maximizing threshold found in the business economics analysis, "
+                           f"not the arbitrary 50% default).")
+                if proba >= OPTIMAL_THRESHOLD:
+                    st.warning("Recommendation: route to retention outreach queue.")
+                else:
+                    st.success("Recommendation: no action needed at this time.")
+
+            with res_col2:
+                st.markdown("**Why this prediction was made:**")
+                try:
+                    preprocessor = model.named_steps["prep"]
+                    tree_model = model.named_steps["model"]
+                    X_transformed = preprocessor.transform(X_input)
+                    feature_names = (NUMERIC_COLS +
+                        list(preprocessor.named_transformers_["cat"].get_feature_names_out(CATEGORICAL_COLS)))
+
+                    explainer = shap.TreeExplainer(tree_model)
+                    shap_values = explainer.shap_values(X_transformed)
+
+                    base_value = explainer.expected_value
+                    base_value = float(base_value[0]) if hasattr(base_value, "__len__") else float(base_value)
+
+                    explanation = shap.Explanation(
+                        values=shap_values[0], base_values=base_value,
+                        data=X_transformed[0], feature_names=feature_names,
+                    )
+                    fig = plt.figure(figsize=(8, 5))
+                    shap.plots.waterfall(explanation, show=False, max_display=10)
+                    st.pyplot(fig, use_container_width=True)
+                    plt.close(fig)
+                except Exception as e:
+                    st.info(f"Explanation unavailable for this input combination. ({e})")
+
+    # =========================================================================
+    # TAB 2: PROJECT-LEVEL INSIGHTS (static, from the analysis)
+    # =========================================================================
+    with tab2:
+        st.subheader("Portfolio-Level Findings")
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Customers Analyzed", "10,000")
+        k2.metric("Overall Churn Rate", "20.4%")
+        k3.metric("Model ROC-AUC", "0.869")
+        k4.metric("Est. Annual Value Unlocked", "$62,750")
+
+        st.markdown("### Key Statistically-Validated Findings")
+        st.markdown("""
+        - **Germany churns at 32.4%** vs. 16-17% in France/Spain — confirmed with a
+          chi-square test (p ≈ 3.8×10⁻⁶⁶), not a coincidence of this sample.
+        - **Customers holding 3+ products churn at 82-100%** — a counter-intuitive
+          red-flag segment, also statistically confirmed (p ≈ 0).
+        - **Churned customers are significantly older** on average (44.8 vs. 37.4
+          years, t-test p ≈ 4.7×10⁻¹⁷⁹).
+        - **"Target everyone" would lose $49,125** on the test set alone — proving
+          a targeted model is genuinely necessary, not just a nice-to-have.
+        """)
+
+        st.markdown("### Model Comparison (5-fold Cross-Validated ROC-AUC)")
+        model_comparison = pd.DataFrame({
+            "Model": ["Logistic Regression", "Random Forest", "Gradient Boosting (selected)"],
+            "CV ROC-AUC": [0.799, 0.859, 0.863],
+        })
+        st.dataframe(model_comparison, hide_index=True, use_container_width=True)
+
+    # =========================================================================
+    # TAB 3: ABOUT
+    # =========================================================================
+    with tab3:
+        st.markdown("""
+        ### About This Project
+
+        **Business problem:** PrimeBank (a simulated retail bank name applied to a
+        real, public 10,000-customer dataset) wanted to know which customers are
+        at risk of leaving, and whether it's actually profitable to intervene.
+
+        **Approach:**
+        1. SQL analysis of churn patterns by geography, product mix, and activity
+        2. Statistical hypothesis testing to confirm findings weren't sampling noise
+        3. A Gradient Boosting model (ROC-AUC 0.869), compared against 2 baselines
+        4. SHAP explainability so every prediction comes with a stated reason
+        5. A business economics analysis finding the profit-maximizing decision
+           threshold — not just the statistically "best" model
+
+        **Full code, SQL, and notebooks:** see the GitHub repository this app is
+        deployed from.
+
+        **Data source:** a real, publicly available bank customer churn dataset
+        (10,000 customers, France/Germany/Spain). No real customer PII is used —
+        the original dataset's customer names were removed before any analysis.
+        """)
+
+
+if __name__ == "__main__":
+    main()
